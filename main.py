@@ -4,6 +4,8 @@ import re
 import json
 import secrets
 import threading
+import shutil
+import subprocess
 from datetime import datetime
 from collections import defaultdict
 
@@ -11,20 +13,23 @@ from colorama import Fore, Style, init as colorama_init
 from termcolor import colored
 import pyfiglet
 
-from flask import Flask, Response, request, render_template, send_file, redirect, abort, session, url_for
+from flask import Flask, Response, request, render_template, send_file, redirect, abort, session
 
 colorama_init(autoreset=True)
+
+IS_WINDOWS = os.name == "nt"
 
 # ---- Flask app ----
 app = Flask(__name__, template_folder="templates")
 app.secret_key = secrets.token_urlsafe(24)
 
-# ---- filesystem layout ----
-DETAIL_DIR = "detailed_logs"
-LOG_FILE = "logs.txt"
-MALICIOUS_FILE = "malicious.txt"
-TEMPLATE_DIR = "templates"
-STATIC_DIR = "static"
+# ---- filesystem layout (cross-platform paths) ----
+BASE_DIR = os.getcwd()
+DETAIL_DIR = os.path.join(BASE_DIR, "detailed_logs")
+LOG_FILE = os.path.join(BASE_DIR, "logs.txt")
+MALICIOUS_FILE = os.path.join(BASE_DIR, "malicious.txt")
+TEMPLATE_DIR = os.path.join(BASE_DIR, "templates")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
 
 os.makedirs(DETAIL_DIR, exist_ok=True)
 os.makedirs(TEMPLATE_DIR, exist_ok=True)
@@ -32,7 +37,7 @@ os.makedirs(STATIC_DIR, exist_ok=True)
 
 # ---- minimal templates if missing ----
 if not os.path.exists(os.path.join(TEMPLATE_DIR, "login.html")):
-    with open(os.path.join(TEMPLATE_DIR, "login.html"), "w") as f:
+    with open(os.path.join(TEMPLATE_DIR, "login.html"), "w", encoding="utf8") as f:
         f.write("""<!doctype html>
 <html><head><meta charset="utf-8"><title>Login</title></head>
 <body style="font-family:Arial,Helvetica,sans-serif;background:#0b1220;color:#e6eef6;padding:20px;">
@@ -45,7 +50,7 @@ if not os.path.exists(os.path.join(TEMPLATE_DIR, "login.html")):
 </body></html>""")
 
 if not os.path.exists(os.path.join(TEMPLATE_DIR, "user_dashboard.html")):
-    with open(os.path.join(TEMPLATE_DIR, "user_dashboard.html"), "w") as f:
+    with open(os.path.join(TEMPLATE_DIR, "user_dashboard.html"), "w", encoding="utf8") as f:
         f.write("""<!doctype html>
 <html><head><meta charset="utf-8"><title>Camera Panel</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -89,7 +94,7 @@ small{color:#94a3b8}
 </div>
 </body></html>""")
 
-# ---- default runtime config (overwritten by setup) ----
+# ---- default runtime config (setup will overwrite) ----
 cfg = {
     "http_port": 8080,
     "server_banner": "Werkzeug/2.0",
@@ -112,6 +117,9 @@ cfg = {
     "dashboard_secret_path": None,
     "onvif_vendor": "GenericVendor",
     "onvif_model": "GenericModel",
+    # media defaults (cross-platform safe)
+    "camera_feed": os.path.join(STATIC_DIR, "camera_feed.mp4"),
+    "snapshot_image": os.path.join(STATIC_DIR, "snapshot.jpg"),
     "geoip_db": None
 }
 
@@ -129,13 +137,105 @@ try:
 except Exception:
     GEOIP_AVAILABLE = False
 
-# util funcs
+# ---- helpers for media generation (cross-platform) ----
+def _ensure_dirs_for(path):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+def ffmpeg_available():
+    return shutil.which("ffmpeg") is not None
+
+def create_placeholder_media(video_path, snapshot_path, width=640, height=360, fps=10, seconds=3):
+    """
+    Cross-platform placeholder creation:
+    - Try OpenCV to create snapshot + short mp4.
+    - If OpenCV fails but ffmpeg is present, create snapshot using OpenCV or raw bytes and then use ffmpeg to make a video.
+    - If neither available, create an empty snapshot file so stream falls back safely.
+    """
+    _ensure_dirs_for(video_path)
+    _ensure_dirs_for(snapshot_path)
+
+    # attempt OpenCV path
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        cv2 = None
+        np = None
+
+    # create snapshot (prefer cv2)
+    if cv2 and np:
+        try:
+            img = np.full((height, width, 3), 30, dtype=np.uint8)
+            text = "Camera Offline"
+            cv2.putText(img, text, (20, height//2), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200,200,200), 2, cv2.LINE_AA)
+            cv2.imwrite(snapshot_path, img)
+        except Exception:
+            try:
+                with open(snapshot_path, "wb") as f:
+                    f.write(b"")
+            except:
+                pass
+    else:
+        # no OpenCV: ensure an empty file exists
+        try:
+            with open(snapshot_path, "wb") as f:
+                f.write(b"")
+        except:
+            pass
+
+    # try to make mp4 via OpenCV
+    made_video = False
+    if cv2 and np:
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
+            if not out.isOpened():
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                out = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
+            for i in range(fps * seconds):
+                frame = np.full((height, width, 3), 20 + (i*3) % 200, dtype=np.uint8)
+                txt = f"ARY CAM {i+1}/{fps*seconds}"
+                cv2.putText(frame, txt, (20, height//2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (220,220,220), 2, cv2.LINE_AA)
+                out.write(frame)
+            out.release()
+            if os.path.exists(video_path):
+                made_video = True
+        except Exception:
+            made_video = False
+
+    # If video not made and ffmpeg exists, try ffmpeg fallback (create video from the snapshot)
+    if not made_video and ffmpeg_available():
+        try:
+            # build ffmpeg command to convert single image to short mp4
+            # -loop 1: loop image, -t seconds: duration, -vf scale: ensure resolution
+            cmd = [
+                "ffmpeg", "-y",
+                "-loop", "1",
+                "-i", snapshot_path,
+                "-c:v", "libx264",
+                "-t", str(seconds),
+                "-pix_fmt", "yuv420p",
+                "-vf", f"scale={width}:{height}",
+                video_path
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            if os.path.exists(video_path):
+                made_video = True
+        except Exception:
+            made_video = False
+
+    # final fallback: ensure snapshot exists (already created) and ensure video doesn't break stream if absent
+    return made_video
+
+# ---- utility functions (same as before) ----
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def write_file_atomic(path, text):
     with log_lock:
-        with open(path, "a") as f:
+        with open(path, "a", encoding="utf8") as f:
             f.write(text + "\n")
 
 def log_all(ip, endpoint, info):
@@ -146,7 +246,7 @@ def log_malicious(ip, reason):
 
 def capture_request(ip, endpoint):
     safe_ep = endpoint.replace("/", "-").strip("-")
-    filename = f"{DETAIL_DIR}/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{ip}_{safe_ep}.json"
+    filename = os.path.join(DETAIL_DIR, f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{ip}_{safe_ep}.json")
     data = {
         "timestamp": now_str(),
         "ip": ip,
@@ -155,10 +255,10 @@ def capture_request(ip, endpoint):
         "headers": dict(request.headers),
         "args": request.args.to_dict(),
         "form": request.form.to_dict(),
-        "cookies": request.cookies,
+        "cookies": dict(request.cookies),
         "raw": request.data.decode(errors="ignore")
     }
-    with open(filename, "w") as fh:
+    with open(filename, "w", encoding="utf8") as fh:
         json.dump(data, fh, indent=2)
 
 PATTERNS = {
@@ -198,7 +298,7 @@ def update_scan(ip, endpoint=None):
 # GeoIP
 _geoip_cache = {}
 def lookup_geo(ip):
-    if not GEOIP_AVAILABLE or not cfg.get("geoip_db"):
+    if not (GEOIP_AVAILABLE and cfg.get("geoip_db")):
         return None
     if ip in _geoip_cache:
         return _geoip_cache[ip]
@@ -220,15 +320,15 @@ def lookup_geo(ip):
     except Exception:
         return None
 
-# MJPEG generator
-def mjpeg_stream_generator(video_path):
+# ---- MJPEG stream generator (fixed, safe) ----
+def mjpeg_stream_generator(video_path, snapshot_path):
     try:
         import cv2
     except Exception:
+        # fallback: repeated snapshot bytes
         while True:
-            path = os.path.join(STATIC_DIR, "snapshot.jpg")
-            if os.path.exists(path):
-                with open(path, "rb") as f:
+            if os.path.exists(snapshot_path):
+                with open(snapshot_path, "rb") as f:
                     jpg = f.read()
             else:
                 jpg = b""
@@ -237,9 +337,8 @@ def mjpeg_stream_generator(video_path):
         cap = cv2.VideoCapture(video_path) if os.path.exists(video_path) else None
         if cap is None or not cap.isOpened():
             while True:
-                path = os.path.join(STATIC_DIR, "snapshot.jpg")
-                if os.path.exists(path):
-                    with open(path, "rb") as f:
+                if os.path.exists(snapshot_path):
+                    with open(snapshot_path, "rb") as f:
                         jpg = f.read()
                 else:
                     jpg = b""
@@ -248,12 +347,12 @@ def mjpeg_stream_generator(video_path):
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    cap.set(1, 0)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     continue
                 _, jpg = cv2.imencode('.jpg', frame)
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg.tobytes() + b"\r\n")
 
-# ---- Flask routes ----
+# ---- Flask routes (same as before) ----
 @app.after_request
 def set_server_headers(resp):
     resp.headers["Server"] = cfg.get("server_banner", "Werkzeug/2.0")
@@ -274,7 +373,7 @@ def video_feed():
     capture_request(ip, "/video_feed")
     log_all(ip, "/video_feed", "stream_requested")
     update_scan(ip, "/video_feed")
-    return Response(mjpeg_stream_generator(os.path.join(STATIC_DIR, "camera_feed.mp4")),
+    return Response(mjpeg_stream_generator(cfg.get("camera_feed"), cfg.get("snapshot_image")),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 # LOGIN: sets session and redirects to secret panel path (neutral UI)
@@ -294,7 +393,6 @@ def admin():
         u = form.get("username", "")
         p = form.get("password", "")
         if u == cfg["admin_user"] and p == cfg["admin_pass"]:
-            # set session and redirect to neutral panel (secret path)
             session['logged_in'] = True
             session['user'] = u
             secret = cfg.get("dashboard_secret_path") or ""
@@ -312,7 +410,7 @@ def camera_live(id):
     capture_request(ip, f"/camera/{id}/live")
     log_all(ip, f"/camera/{id}/live", "view")
     update_scan(ip, f"/camera/{id}/live")
-    return Response(mjpeg_stream_generator(os.path.join(STATIC_DIR, "camera_feed.mp4")),
+    return Response(mjpeg_stream_generator(cfg.get("camera_feed"), cfg.get("snapshot_image")),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route("/snapshot.jpg")
@@ -321,7 +419,7 @@ def snapshot():
     capture_request(ip, "/snapshot.jpg")
     log_all(ip, "/snapshot.jpg", "snapshot_requested")
     update_scan(ip, "/snapshot.jpg")
-    path = os.path.join(STATIC_DIR, "snapshot.jpg")
+    path = cfg.get("snapshot_image")
     if os.path.exists(path):
         return send_file(path)
     return "", 404
@@ -371,7 +469,7 @@ def fake_rtsp(stream):
                 f"Content-Length: {len(sdp)}\r\n\r\n{sdp}")
         return Response(resp, mimetype="text/plain")
     if "PLAY" in raw_upper:
-        return Response(mjpeg_stream_generator(os.path.join(STATIC_DIR, "camera_feed.mp4")),
+        return Response(mjpeg_stream_generator(cfg.get("camera_feed"), cfg.get("snapshot_image")),
                         mimetype='multipart/x-mixed-replace; boundary=frame')
     return Response("RTSP/1.0 400 Bad Request\r\n\r\n", mimetype="text/plain")
 
@@ -410,26 +508,21 @@ def onvif_device_service():
 # ----- SECRET ROUTES: panel (neutral) and logs (protected) -----
 @app.route("/<path:maybe>/<path:subpath>")
 def catch_secret_sub(maybe, subpath):
-    # example: /<secret>/panel or /<secret>/logs
     secret = cfg.get("dashboard_secret_path") or ""
     if maybe != secret:
         return abort(404)
-    # must be logged in to access secret subpaths
     if not session.get("logged_in"):
         return abort(404)
     if subpath == "panel":
-        # neutral panel (no logs)
         return render_template("user_dashboard.html")
     if subpath == "logs":
-        # protected logs view (secret)
         malicious = ""
         try:
-            with open(MALICIOUS_FILE, "r") as f:
+            with open(MALICIOUS_FILE, "r", encoding="utf8") as f:
                 malicious = f.read()
         except Exception:
             malicious = ""
         detailed_files = sorted(os.listdir(DETAIL_DIR))[-200:]
-        # build a simple logs page
         html = "<html><body><h1>Secret Admin Logs</h1>"
         html += "<h2>Malicious Events</h2><pre>" + malicious + "</pre>"
         html += "<h2>Detailed Logs</h2><ul>"
@@ -441,23 +534,22 @@ def catch_secret_sub(maybe, subpath):
 
 @app.route("/_detailed/<path:fname>")
 def view_detailed(fname):
-    # serve detailed log file (protected by session in secret logs link)
     safe_path = os.path.join(DETAIL_DIR, os.path.basename(fname))
     if not os.path.exists(safe_path):
         return abort(404)
-    # optionally require session to view (we allow if session exists)
     if not session.get("logged_in"):
         return abort(404)
     try:
-        with open(safe_path, "r") as fh:
+        with open(safe_path, "r", encoding="utf8") as fh:
             content = fh.read()
     except Exception:
         content = ""
     return "<pre>" + content + "</pre>"
 
-# ---- Setup / Terminal UI ----
+# ---- Setup / Terminal UI (cross-platform) ----
 def print_banner():
-    os.system("cls" if os.name == "nt" else "clear")
+    # clear console cross-platform
+    os.system("cls" if IS_WINDOWS else "clear")
     art = pyfiglet.figlet_format("ARY CAM HONEYPOT", font="slant")
     print(colored(art, "cyan"))
     print(Fore.YELLOW + "               Made By Aryan Giri" + Style.RESET_ALL)
@@ -482,12 +574,37 @@ def prompt_setup():
         banner_in = input(Fore.YELLOW + f"HTTP Server banner header [default: {cfg['server_banner']}]: " + Style.RESET_ALL).strip()
         if banner_in:
             cfg['server_banner'] = banner_in
+
+        # camera feed file input (cross-platform)
+        default_cam = cfg['camera_feed']
+        default_snap = cfg['snapshot_image']
+        cam_in = input(Fore.YELLOW + f"Camera feed .mp4 path [default: {default_cam}]: " + Style.RESET_ALL).strip()
+        if cam_in:
+            cfg['camera_feed'] = os.path.expanduser(cam_in)
+        snap_in = input(Fore.YELLOW + f"Snapshot image .jpg path [default: {default_snap}]: " + Style.RESET_ALL).strip()
+        if snap_in:
+            cfg['snapshot_image'] = os.path.expanduser(snap_in)
+
+        # ensure static dirs and files exist (or create placeholders)
+        _ensure_dirs_for(cfg['camera_feed'])
+        _ensure_dirs_for(cfg['snapshot_image'])
+
+        # Create placeholder media if missing
+        if not os.path.exists(cfg['snapshot_image']) or not os.path.exists(cfg['camera_feed']):
+            print(Fore.BLUE + "[*] One or more media files missing. Attempting to create placeholder snapshot and short video (OpenCV or ffmpeg required)." + Style.RESET_ALL)
+            made = create_placeholder_media(cfg['camera_feed'], cfg['snapshot_image'])
+            if made:
+                print(Fore.GREEN + "[*] Placeholder video + snapshot created." + Style.RESET_ALL)
+            else:
+                print(Fore.YELLOW + "[*] Placeholder snapshot created (video may be missing). Stream will fallback to snapshot." + Style.RESET_ALL)
+
         # secret path
         secret_in = input(Fore.YELLOW + "Secret admin token path (e.g. mypanel) [press ENTER for random]: " + Style.RESET_ALL).strip()
         if secret_in:
             cfg['dashboard_secret_path'] = secret_in.strip().lstrip("/")
         else:
             cfg['dashboard_secret_path'] = secrets.token_urlsafe(8)
+
         # onvif vendor/model
         vendor_in = input(Fore.YELLOW + f"ONVIF vendor [default: {cfg['onvif_vendor']}]: " + Style.RESET_ALL).strip()
         if vendor_in:
@@ -495,6 +612,7 @@ def prompt_setup():
         model_in = input(Fore.YELLOW + f"ONVIF model [default: {cfg['onvif_model']}]: " + Style.RESET_ALL).strip()
         if model_in:
             cfg['onvif_model'] = model_in
+
         # RTSP
         rtsp_choice = input(Fore.YELLOW + "Enable RTSP simulation? (y/N): " + Style.RESET_ALL).strip().lower()
         if rtsp_choice == "y":
@@ -506,6 +624,7 @@ def prompt_setup():
             sdp_in = input()
             if sdp_in.strip():
                 cfg['rtsp_sdp'] = sdp_in
+
         # geoip
         geo_in = input(Fore.YELLOW + "GeoIP DB path (.mmdb) [press ENTER to skip]: " + Style.RESET_ALL).strip()
         if geo_in:
@@ -514,6 +633,7 @@ def prompt_setup():
                 print(Fore.GREEN + "GeoIP configured." + Style.RESET_ALL)
             else:
                 print(Fore.RED + "GeoIP not configured (missing geoip2 or file)." + Style.RESET_ALL)
+
         # detection tuning
         sl = input(Fore.YELLOW + f"Rapid-scan limit [default: {cfg['scan_limit']}]: " + Style.RESET_ALL).strip()
         if sl.isdigit():
@@ -527,11 +647,14 @@ def prompt_setup():
         bw = input(Fore.YELLOW + f"Brute window seconds [default: {cfg['brute_window']}]: " + Style.RESET_ALL).strip()
         if bw.isdigit():
             cfg['brute_window'] = int(bw)
+
         print()
         print(Fore.GREEN + "[+] Configuration complete." + Style.RESET_ALL)
         print(Fore.GREEN + f"[+] HTTP port: {cfg['http_port']}" + Style.RESET_ALL)
         print(Fore.GREEN + f"[+] Secret panel will be at: /{cfg['dashboard_secret_path']}/panel" + Style.RESET_ALL)
         print(Fore.GREEN + f"[+] Secret logs at: /{cfg['dashboard_secret_path']}/logs (session required)" + Style.RESET_ALL)
+        print(Fore.GREEN + f"[+] Camera feed: {cfg['camera_feed']}" + Style.RESET_ALL)
+        print(Fore.GREEN + f"[+] Snapshot image: {cfg['snapshot_image']}" + Style.RESET_ALL)
         if cfg.get('geoip_db'):
             print(Fore.GREEN + f"[+] GeoIP DB: {cfg['geoip_db']}" + Style.RESET_ALL)
         print()
@@ -545,7 +668,8 @@ def main():
     port = cfg['http_port']
     print(f"Starting on http://{host}:{port} (secret panel: /{cfg['dashboard_secret_path']}/panel)")
     try:
-        app.run(host=host, port=port, debug=False)
+        # debug=False for safety; threaded True helps handle multiple stream clients cross-platform
+        app.run(host=host, port=port, debug=False, threaded=True)
     except Exception as e:
         print("Failed to start Flask app:", e)
 
